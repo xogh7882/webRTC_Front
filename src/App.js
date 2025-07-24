@@ -75,23 +75,39 @@ function App() {
   };
 
   const handleSignalingMessage = async (message) => {
+    console.log('Processing message type:', message.type);
+    
     switch (message.type) {
       case 'connected':
         setStatus('WebSocket Connected as ' + userId);
         break;
         
       case 'room-joined':
-        setStatus('Joined room: ' + message.roomId);
-        // 참가자 수 파싱
+        setStatus('Joined room: ' + (message.roomId || 'unknown'));
         if (message.message && message.message.includes('Participants:')) {
           const count = parseInt(message.message.split('Participants: ')[1]);
           setParticipants(count);
+        }
+        
+        // Room 조인 성공 후 미디어 시작
+        try {
+          const stream = await startLocalVideo();
+          if (stream) {
+            await createPeerConnection(stream);
+          }
+        } catch (error) {
+          console.error('Error starting media after room join:', error);
+          setStatus('Media Error: ' + error.message);
         }
         break;
         
       case 'user-joined':
         setStatus('New user joined the room');
         setParticipants(prev => prev + 1);
+        // 새 사용자가 들어오면 Offer 재전송
+        if (peerConnectionRef.current && localStreamRef.current) {
+          setTimeout(() => sendOffer(), 1000);
+        }
         break;
         
       case 'user-left':
@@ -100,7 +116,25 @@ function App() {
         break;
         
       case 'answer':
-        await handleAnswer(message.sdp);
+        if (message.sdp) {
+          await handleAnswer(message.sdp);
+        } else {
+          console.error('Received answer without SDP');
+        }
+        break;
+        
+      case 'remote-offer':
+        // 다른 클라이언트로부터의 Offer 처리
+        if (message.sdp && peerConnectionRef.current) {
+          await handleRemoteOffer(message.sdp, message.fromSession);
+        }
+        break;
+        
+      case 'remote-answer':
+        // 다른 클라이언트로부터의 Answer 처리
+        if (message.sdp && peerConnectionRef.current) {
+          await handleRemoteAnswer(message.sdp, message.fromSession);
+        }
         break;
         
       case 'ice-candidate':
@@ -118,7 +152,7 @@ function App() {
         
       case 'error':
         console.error('Server error:', message.message);
-        setStatus('Error: ' + message.message);
+        setStatus('Error: ' + (message.message || 'Unknown error'));
         break;
         
       default:
@@ -126,12 +160,29 @@ function App() {
     }
   };
 
-  const joinRoom = () => {
-    if (ws && roomId.trim()) {
+  const startCall = async () => {
+    try {
+      if (!connected || !ws) {
+        setStatus('WebSocket not connected. Please connect first.');
+        return;
+      }
+
+      if (!roomId || roomId.trim() === '') {
+        setStatus('Please enter a room ID');
+        return;
+      }
+
+      // Room에 조인
       sendMessage({
         type: 'join-room',
         roomId: roomId.trim()
       });
+
+      setStatus('Joining room...');
+
+    } catch (error) {
+      console.error('Error starting call:', error);
+      setStatus('Error starting call: ' + error.message);
     }
   };
 
@@ -142,7 +193,9 @@ function App() {
         audio: true
       });
       
-      localVideoRef.current.srcObject = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
       localStreamRef.current = stream;
       setStatus('Camera Ready - ' + userId);
       
@@ -154,96 +207,100 @@ function App() {
     }
   };
 
-  const createPeerConnection = () => {
-    const pc = new RTCPeerConnection({ iceServers });
-    
-    // ICE 후보자 이벤트
-    pc.onicecandidate = (event) => {
-      if (event.candidate && ws) {
-        console.log('Sending ICE candidate:', event.candidate);
-        sendMessage({
-          type: 'ice-candidate',
-          candidate: event.candidate.candidate,
-          sdpMid: event.candidate.sdpMid,
-          sdpMLineIndex: event.candidate.sdpMLineIndex,
-          roomId: roomId
-        });
-      }
-    };
-
-    // 원격 스트림 수신
-    pc.ontrack = (event) => {
-      console.log('Received remote stream:', event.streams[0]);
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = event.streams[0];
-      }
-    };
-
-    // 연결 상태 모니터링
-    pc.onconnectionstatechange = () => {
-      console.log('Connection state:', pc.connectionState);
-      setStatus(userId + ' - Connection: ' + pc.connectionState);
-      
-      if (pc.connectionState === 'connected') {
-        setStatus(userId + ' - Connected to room: ' + roomId);
-      }
-    };
-
-    // ICE 연결 상태 모니터링
-    pc.oniceconnectionstatechange = () => {
-      console.log('ICE connection state:', pc.iceConnectionState);
-      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-        setStatus(userId + ' - Video call active');
-      }
-    };
-
-    return pc;
-  };
-
-  const startCall = async () => {
+  const createPeerConnection = async (stream) => {
     try {
-      setStatus('Starting call...');
+      const pc = new RTCPeerConnection({ iceServers });
       
-      // 먼저 룸에 참가
-      joinRoom();
-      
-      // 로컬 비디오 스트림 획득
-      const stream = await startLocalVideo();
-      
-      // PeerConnection 생성
-      const pc = createPeerConnection();
-      peerConnectionRef.current = pc;
-      
-      // 로컬 스트림을 PeerConnection에 추가
+      // 로컬 스트림 추가
       stream.getTracks().forEach(track => {
         pc.addTrack(track, stream);
+        console.log('Added local track:', track.kind);
       });
+      
+      // 원격 스트림 처리
+      pc.ontrack = (event) => {
+        console.log('Remote stream received:', event.streams[0]);
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        }
+        setStatus(userId + ' - Connected with remote peer');
+      };
+      
+      // ICE candidate 처리
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          console.log('Sending ICE candidate:', event.candidate.candidate);
+          sendMessage({
+            type: 'ice-candidate',
+            candidate: event.candidate.candidate,
+            sdpMid: event.candidate.sdpMid,
+            sdpMLineIndex: event.candidate.sdpMLineIndex,
+            roomId: roomId
+          });
+        }
+      };
+      
+      pc.onconnectionstatechange = () => {
+        console.log('Connection state:', pc.connectionState);
+        if (pc.connectionState === 'connected') {
+          setStatus(userId + ' - WebRTC Connected');
+        } else if (pc.connectionState === 'failed') {
+          setStatus(userId + ' - Connection Failed');
+        } else if (pc.connectionState === 'disconnected') {
+          setStatus(userId + ' - Connection Lost');
+        }
+      };
 
-      // SDP Offer 생성
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+      pc.oniceconnectionstatechange = () => {
+        console.log('ICE connection state:', pc.iceConnectionState);
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          setStatus(userId + ' - Video call active');
+        }
+      };
       
-      console.log('Created offer:', offer);
+      peerConnectionRef.current = pc;
+      setInCall(true);
       
-      // 서버로 Offer 전송
+      // 다른 참가자가 있을 때만 즉시 Offer 전송
+      if (participants > 0) {
+        await sendOffer();
+      }
+      
+    } catch (error) {
+      console.error('Error creating peer connection:', error);
+      setStatus('WebRTC Error: ' + error.message);
+    }
+  };
+
+  const sendOffer = async () => {
+    try {
+      if (!peerConnectionRef.current) return;
+      
+      const offer = await peerConnectionRef.current.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true
+      });
+      
+      await peerConnectionRef.current.setLocalDescription(offer);
+      
+      console.log('Sending offer:', offer);
       sendMessage({
         type: 'offer',
         sdp: offer.sdp,
         roomId: roomId
       });
       
-      setInCall(true);
       setStatus(userId + ' - Calling...');
       
     } catch (error) {
-      console.error('Error starting call:', error);
-      setStatus('Call Failed: ' + error.message);
+      console.error('Error sending offer:', error);
+      setStatus('Offer Error: ' + error.message);
     }
   };
 
   const handleAnswer = async (sdp) => {
     try {
-      console.log('Received answer:', sdp);
+      console.log('Received answer:', sdp.substring(0, 100) + '...');
       
       const answer = new RTCSessionDescription({
         type: 'answer',
@@ -259,8 +316,77 @@ function App() {
     }
   };
 
+  const handleRemoteOffer = async (sdp, fromSession) => {
+    try {
+      console.log('Received remote offer from:', fromSession);
+      
+      if (!peerConnectionRef.current) {
+        console.error('No peer connection available');
+        return;
+      }
+      
+      const offer = new RTCSessionDescription({
+        type: 'offer',
+        sdp: sdp
+      });
+      
+      await peerConnectionRef.current.setRemoteDescription(offer);
+      
+      // Answer 생성 및 전송
+      const answer = await peerConnectionRef.current.createAnswer();
+      await peerConnectionRef.current.setLocalDescription(answer);
+      
+      console.log('Sending answer to remote peer');
+      sendMessage({
+        type: 'remote-answer',
+        sdp: answer.sdp,
+        toSession: fromSession,
+        roomId: roomId
+      });
+      
+      setStatus(userId + ' - Answering call from remote peer');
+      
+    } catch (error) {
+      console.error('Error handling remote offer:', error);
+      setStatus('Remote Offer Error: ' + error.message);
+    }
+  };
+
+  const handleRemoteAnswer = async (sdp, fromSession) => {
+    try {
+      console.log('Received remote answer from:', fromSession);
+      
+      if (!peerConnectionRef.current) {
+        console.error('No peer connection available');
+        return;
+      }
+      
+      const answer = new RTCSessionDescription({
+        type: 'answer',
+        sdp: sdp
+      });
+      
+      await peerConnectionRef.current.setRemoteDescription(answer);
+      setStatus(userId + ' - Connected to remote peer');
+      
+    } catch (error) {
+      console.error('Error handling remote answer:', error);
+      setStatus('Remote Answer Error: ' + error.message);
+    }
+  };
+
   const handleIceCandidate = async (message) => {
     try {
+      if (!message.candidate || !message.sdpMid || message.sdpMLineIndex === undefined) {
+        console.error('Invalid ICE candidate message:', message);
+        return;
+      }
+
+      if (!peerConnectionRef.current) {
+        console.error('No peer connection available for ICE candidate');
+        return;
+      }
+      
       const candidate = new RTCIceCandidate({
         candidate: message.candidate,
         sdpMid: message.sdpMid,
@@ -268,7 +394,7 @@ function App() {
       });
       
       await peerConnectionRef.current.addIceCandidate(candidate);
-      console.log('Added ICE candidate');
+      console.log('Added ICE candidate from:', message.fromSession || 'server');
       
     } catch (error) {
       console.error('Error adding ICE candidate:', error);
@@ -299,7 +425,8 @@ function App() {
     // 서버에 통화 종료 알림
     if (ws && inCall) {
       sendMessage({
-        type: 'end-call'
+        type: 'end-call',
+        roomId: roomId
       });
       
       sendMessage({
@@ -314,11 +441,20 @@ function App() {
   };
 
   const sendMessage = (message) => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(message));
-    } else {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.error('WebSocket is not connected');
+      setStatus('WebSocket not connected');
+      return;
     }
+    
+    // 필수 필드 검증
+    if (!message.type) {
+      console.error('Message type is required');
+      return;
+    }
+    
+    console.log('Sending message:', message.type, message);
+    ws.send(JSON.stringify(message));
   };
 
   const generateNewRoomId = () => {
@@ -391,6 +527,7 @@ function App() {
             <li>Enter the same Room ID</li>
             <li>Both click "Join Room & Start Call"</li>
             <li>Allow camera/microphone access</li>
+            <li>Wait for WebRTC connection to establish</li>
           </ol>
         </div>
 
@@ -417,6 +554,13 @@ function App() {
               height="200"
             />
           </div>
+        </div>
+
+        <div className="debug-info">
+          <h4>Debug Info:</h4>
+          <p>WebSocket: {connected ? '🟢 Connected' : '🔴 Disconnected'}</p>
+          <p>WebRTC: {inCall ? '🟢 Active' : '🔴 Inactive'}</p>
+          <p>Room: {roomId}</p>
         </div>
       </header>
     </div>
