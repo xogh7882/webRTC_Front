@@ -1,0 +1,216 @@
+.App {
+  text-align: center;
+}
+
+.App-header {
+  background-color: #282c34;
+  padding: 20px;
+  color: white;
+  min-height: 100vh;
+}
+
+.App h1 {
+  margin-bottom: 30px;
+  color: #61dafb;
+}
+
+.status {
+  margin: 20px 0;
+  padding: 10px;
+  background-color: #444;
+  border-radius: 5px;
+}
+
+.status .connected {
+  color: #4CAF50;
+  font-weight: bold;
+}
+
+.status .disconnected {
+  color: #f44336;
+  font-weight: bold;
+}
+
+.controls {
+  margin: 30px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  align-items: center;
+}
+
+.connection-controls,
+.room-controls,
+.call-controls {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.room-controls label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.user-info {
+  margin: 15px 0;
+  padding: 10px;
+  background-color: #333;
+  border-radius: 5px;
+  border-left: 4px solid #61dafb;
+}
+
+.user-info p {
+  margin: 5px 0;
+  font-size: 14px;
+}
+
+.instructions {
+  margin: 20px 0;
+  padding: 15px;
+  background-color: #444;
+  border-radius: 8px;
+  border: 1px solid #61dafb;
+  max-width: 600px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.instructions h3 {
+  color: #61dafb;
+  margin-top: 0;
+}
+
+.instructions ol {
+  text-align: left;
+  padding-left: 20px;
+}
+
+.instructions li {
+  margin: 8px 0;
+  line-height: 1.4;
+}
+
+.room-controls input {
+  padding: 8px 12px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 14px;
+  width: 200px;
+}
+
+button {
+  background-color: #61dafb;
+  border: none;
+  color: #282c34;
+  padding: 12px 24px;
+  text-align: center;
+  text-decoration: none;
+  display: inline-block;
+  font-size: 16px;
+  font-weight: bold;
+  margin: 4px 2px;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: background-color 0.3s;
+}
+
+button:hover {
+  background-color: #4fa8c5;
+}
+
+button:disabled {
+  background-color: #666;
+  cursor: not-allowed;
+}
+
+.start-call {
+  background-color: #4CAF50;
+  color: white;
+}
+
+.start-call:hover {
+  background-color: #45a049;
+}
+
+.end-call {
+  background-color: #f44336;
+  color: white;
+}
+
+.end-call:hover {
+  background-color: #da190b;
+}
+
+.video-container {
+  display: flex;
+  justify-content: center;
+  gap: 30px;
+  margin-top: 30px;
+  flex-wrap: wrap;
+}
+
+.video-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.video-box h3 {
+  margin: 0;
+  color: #61dafb;
+  font-size: 18px;
+}
+
+video {
+  border: 2px solid #61dafb;
+  border-radius: 8px;
+  background-color: #000;
+}
+
+video:not([src]) {
+  background-color: #333;
+}
+
+/* 반응형 디자인 */
+@media (max-width: 768px) {
+  .video-container {
+    flex-direction: column;
+    align-items: center;
+  }
+  
+  .controls {
+    gap: 20px;
+  }
+  
+  .connection-controls,
+  .room-controls,
+  .call-controls {
+    flex-direction: column;
+    gap: 10px;
+  }
+  
+  video {
+    width: 250px;
+    height: 166px;
+  }
+}
+
+/* 로딩 애니메이션 */
+@keyframes pulse {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.status .connected {
+  animation: pulse 2s infinite;
+}
