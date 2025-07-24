@@ -1,6 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
 import './App.css';
-import SockJS from 'sockjs-client';
 
 function App() {
   const [ws, setWs] = useState(null);
@@ -35,35 +34,57 @@ function App() {
 
   const connectWebSocket = () => {
     try {
-      const socket = new SockJS('http://localhost:8080/signaling');
+      // 기존 연결이 있으면 정리
+      if (ws) {
+        ws.close();
+        setWs(null);
+      }
+      
+      // Native WebSocket 사용 (SockJS 대신)
+      const socket = new WebSocket('ws://localhost:8080/ws');
       
       socket.onopen = () => {
-        console.log('WebSocket connected');
+        console.log('✅ Native WebSocket connected');
         setConnected(true);
         setStatus('Connected as ' + userId);
         setWs(socket);
       };
 
       socket.onmessage = (event) => {
-        const message = JSON.parse(event.data);
-        console.log('Received message:', message);
-        handleSignalingMessage(message);
+        try {
+          const message = JSON.parse(event.data);
+          console.log('📥 Received message:', message);
+          handleSignalingMessage(message);
+        } catch (error) {
+          console.error('❌ Error parsing message:', error);
+        }
       };
 
-      socket.onclose = () => {
-        console.log('WebSocket disconnected');
+      socket.onclose = (event) => {
+        console.log('🔌 WebSocket disconnected, code:', event.code, 'reason:', event.reason);
         setConnected(false);
         setStatus('Disconnected');
         setWs(null);
+        
+        // 비정상 종료시 자동 재연결 시도 (3초 후)
+        if (event.code !== 1000 && inCall) {
+          console.log('🔄 Unexpected disconnection, will retry in 3 seconds...');
+          setTimeout(() => {
+            if (!connected) {
+              console.log('🔄 Attempting automatic reconnection...');
+              connectWebSocket();
+            }
+          }, 3000);
+        }
       };
 
       socket.onerror = (error) => {
-        console.error('WebSocket error:', error);
+        console.error('❌ WebSocket error:', error);
         setStatus('Connection Error');
       };
 
     } catch (error) {
-      console.error('Failed to connect WebSocket:', error);
+      console.error('❌ Failed to connect WebSocket:', error);
       setStatus('Connection Failed');
     }
   };
@@ -104,9 +125,21 @@ function App() {
       case 'user-joined':
         setStatus('New user joined the room');
         setParticipants(prev => prev + 1);
-        // 새 사용자가 들어오면 Offer 재전송
+        
+        // WebSocket 연결 상태 다시 확인
+        console.log('🔍 WebSocket state after user-joined:', ws ? ws.readyState : 'null');
+        
+        // 새 사용자가 들어오면 Offer 재전송 (연결 상태 확인 후)
         if (peerConnectionRef.current && localStreamRef.current) {
-          setTimeout(() => sendOffer(), 1000);
+          setTimeout(() => {
+            console.log('🔍 Delayed WebSocket check:', ws ? ws.readyState : 'null');
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              console.log('📤 Sending delayed offer...');
+              sendOffer();
+            } else {
+              console.warn('⚠️ WebSocket not ready for delayed offer');
+            }
+          }, 2000); // 2초로 증가
         }
         break;
         
@@ -230,13 +263,19 @@ function App() {
       pc.onicecandidate = (event) => {
         if (event.candidate) {
           console.log('Sending ICE candidate:', event.candidate.candidate);
-          sendMessage({
-            type: 'ice-candidate',
-            candidate: event.candidate.candidate,
-            sdpMid: event.candidate.sdpMid,
-            sdpMLineIndex: event.candidate.sdpMLineIndex,
-            roomId: roomId
-          });
+          
+          // WebSocket 연결 상태 확인 후 전송
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            sendMessage({
+              type: 'ice-candidate',
+              candidate: event.candidate.candidate,
+              sdpMid: event.candidate.sdpMid,
+              sdpMLineIndex: event.candidate.sdpMLineIndex,
+              roomId: roomId
+            });
+          } else {
+            console.warn('Cannot send ICE candidate - WebSocket not connected');
+          }
         }
       };
       
@@ -274,7 +313,15 @@ function App() {
 
   const sendOffer = async () => {
     try {
-      if (!peerConnectionRef.current) return;
+      if (!peerConnectionRef.current) {
+        console.warn('No peer connection available for offer');
+        return;
+      }
+      
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        console.warn('WebSocket not ready for offer');
+        return;
+      }
       
       const offer = await peerConnectionRef.current.createOffer({
         offerToReceiveAudio: true,
@@ -441,9 +488,23 @@ function App() {
   };
 
   const sendMessage = (message) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      console.error('WebSocket is not connected');
-      setStatus('WebSocket not connected');
+    if (!ws) {
+      console.error('WebSocket is null');
+      setStatus('WebSocket connection lost');
+      return;
+    }
+    
+    if (ws.readyState !== WebSocket.OPEN) {
+      console.error('WebSocket is not connected, state:', ws.readyState);
+      setStatus('WebSocket not connected - attempting reconnect...');
+      
+      // 자동 재연결 시도
+      setTimeout(() => {
+        if (!connected) {
+          console.log('Attempting to reconnect...');
+          connectWebSocket();
+        }
+      }, 2000);
       return;
     }
     
@@ -453,8 +514,13 @@ function App() {
       return;
     }
     
-    console.log('Sending message:', message.type, message);
-    ws.send(JSON.stringify(message));
+    try {
+      console.log('Sending message:', message.type, message);
+      ws.send(JSON.stringify(message));
+    } catch (error) {
+      console.error('Error sending message:', error);
+      setStatus('Message send failed');
+    }
   };
 
   const generateNewRoomId = () => {
