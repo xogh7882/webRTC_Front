@@ -1,632 +1,544 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import './App.css';
+import SockJS from 'sockjs-client';
 
 function App() {
-  const [ws, setWs] = useState(null);
   const [connected, setConnected] = useState(false);
   const [inCall, setInCall] = useState(false);
   const [roomId, setRoomId] = useState('room-' + Math.random().toString(36).substr(2, 9));
   const [status, setStatus] = useState('Disconnected');
   const [participants, setParticipants] = useState(0);
   const [userId] = useState('User-' + Math.random().toString(36).substr(2, 6));
+  const [isCaller, setIsCaller] = useState(false);
   
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const localStreamRef = useRef(null);
+  const wsRef = useRef(null); // WebSocket을 ref로 관리
 
-  // ICE 서버 설정 (STUN/TURN)
+  // 서버 설정
+  const SERVER_URL = 'http://58.76.166.46:8080';
+  
+  // ICE 서버 설정
   const iceServers = [
-    { urls: 'stun:localhost:3478' },
-    { urls: 'stun:stun.l.google.com:19302' } // 백업 STUN 서버
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
   ];
 
   useEffect(() => {
     return () => {
-      if (ws) {
-        ws.close();
-      }
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach(track => track.stop());
-      }
+      cleanup();
     };
-  }, [ws]);
+  }, []);
 
-  const connectWebSocket = () => {
+  const cleanup = useCallback(() => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
+    }
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+  }, []);
+
+  const connectWebSocket = useCallback(() => {
     try {
-      // 기존 연결이 있으면 정리
-      if (ws) {
-        ws.close();
-        setWs(null);
-      }
-      
-      // Native WebSocket 사용 (SockJS 대신)
-      const socket = new WebSocket('ws://localhost:8080/ws');
+      console.log('🔌 Connecting to:', SERVER_URL);
+      const socket = new SockJS(SERVER_URL + '/signaling');
+      wsRef.current = socket;
       
       socket.onopen = () => {
-        console.log('✅ Native WebSocket connected');
+        console.log('✅ WebSocket connected');
         setConnected(true);
-        setStatus('Connected as ' + userId);
-        setWs(socket);
+        setStatus('Connected - Ready to join room');
       };
 
       socket.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data);
-          console.log('📥 Received message:', message);
-          handleSignalingMessage(message);
-        } catch (error) {
-          console.error('❌ Error parsing message:', error);
-        }
+        const message = JSON.parse(event.data);
+        console.log('📨 Received:', message);
+        handleMessage(message);
       };
 
-      socket.onclose = (event) => {
-        console.log('🔌 WebSocket disconnected, code:', event.code, 'reason:', event.reason);
+      socket.onclose = () => {
+        console.log('❌ WebSocket disconnected');
         setConnected(false);
         setStatus('Disconnected');
-        setWs(null);
-        
-        // 비정상 종료시 자동 재연결 시도 (3초 후)
-        if (event.code !== 1000 && inCall) {
-          console.log('🔄 Unexpected disconnection, will retry in 3 seconds...');
-          setTimeout(() => {
-            if (!connected) {
-              console.log('🔄 Attempting automatic reconnection...');
-              connectWebSocket();
-            }
-          }, 3000);
-        }
+        wsRef.current = null;
       };
 
       socket.onerror = (error) => {
-        console.error('❌ WebSocket error:', error);
+        console.error('🚨 WebSocket error:', error);
         setStatus('Connection Error');
       };
 
     } catch (error) {
-      console.error('❌ Failed to connect WebSocket:', error);
+      console.error('Failed to connect:', error);
       setStatus('Connection Failed');
     }
-  };
+  }, []);
 
-  const disconnectWebSocket = () => {
-    if (ws) {
-      ws.close();
-    }
-  };
-
-  const handleSignalingMessage = async (message) => {
-    console.log('Processing message type:', message.type);
+  const handleMessage = useCallback(async (message) => {
+    console.log('🔄 Processing message type:', message.type);
     
     switch (message.type) {
-      case 'connected':
-        setStatus('WebSocket Connected as ' + userId);
-        break;
-        
       case 'room-joined':
-        setStatus('Joined room: ' + (message.roomId || 'unknown'));
-        if (message.message && message.message.includes('Participants:')) {
-          const count = parseInt(message.message.split('Participants: ')[1]);
-          setParticipants(count);
-        }
+        const count = message.participants || 1;
+        setParticipants(count);
+        setStatus(`✅ Joined room (${count} participants)`);
         
-        // Room 조인 성공 후 미디어 시작
-        try {
-          const stream = await startLocalVideo();
-          if (stream) {
-            await createPeerConnection(stream);
-          }
-        } catch (error) {
-          console.error('Error starting media after room join:', error);
-          setStatus('Media Error: ' + error.message);
+        if (count === 1) {
+          console.log('👤 First user in room - waiting for others');
+          setIsCaller(false);
         }
         break;
         
       case 'user-joined':
-        setStatus('New user joined the room');
-        setParticipants(prev => prev + 1);
+        const newCount = message.participants || 2;
+        setParticipants(newCount);
+        setStatus(`👥 ${newCount} participants - Starting video call...`);
         
-        // WebSocket 연결 상태 다시 확인
-        console.log('🔍 WebSocket state after user-joined:', ws ? ws.readyState : 'null');
+        console.log('🔍 Current WebSocket state:', wsRef.current);
+        console.log('🔍 WebSocket readyState:', wsRef.current ? wsRef.current.readyState : 'null');
         
-        // 새 사용자가 들어오면 Offer 재전송 (연결 상태 확인 후)
-        if (peerConnectionRef.current && localStreamRef.current) {
+        if (newCount === 2 && !isCaller && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          console.log('🚀 Second user joined - I become the caller');
+          setIsCaller(true);
           setTimeout(() => {
-            console.log('🔍 Delayed WebSocket check:', ws ? ws.readyState : 'null');
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              console.log('📤 Sending delayed offer...');
-              sendOffer();
+            console.log('🔍 Delayed WebSocket check:', wsRef.current);
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              console.log('✅ Starting delayed call');
+              startCall();
             } else {
-              console.warn('⚠️ WebSocket not ready for delayed offer');
+              console.log('⚠️ WebSocket not ready for delayed call');
             }
-          }, 2000); // 2초로 증가
+          }, 1000);
         }
         break;
         
-      case 'user-left':
-        setStatus('User left the room');
-        setParticipants(prev => Math.max(0, prev - 1));
+      case 'offer':
+        console.log('📞 Received offer');
+        await handleOffer(message.offer);
         break;
         
       case 'answer':
-        if (message.sdp) {
-          await handleAnswer(message.sdp);
-        } else {
-          console.error('Received answer without SDP');
-        }
-        break;
-        
-      case 'remote-offer':
-        // 다른 클라이언트로부터의 Offer 처리
-        if (message.sdp && peerConnectionRef.current) {
-          await handleRemoteOffer(message.sdp, message.fromSession);
-        }
-        break;
-        
-      case 'remote-answer':
-        // 다른 클라이언트로부터의 Answer 처리
-        if (message.sdp && peerConnectionRef.current) {
-          await handleRemoteAnswer(message.sdp, message.fromSession);
-        }
+        console.log('📞 Received answer');
+        await handleAnswer(message.answer);
         break;
         
       case 'ice-candidate':
-        await handleIceCandidate(message);
+        console.log('🧊 Received ICE candidate');
+        await handleIceCandidate(message.candidate);
         break;
         
-      case 'call-started':
-        setStatus('Call Started');
-        break;
-        
-      case 'call-ended':
-        setStatus('Call Ended');
+      case 'user-left':
+        const remainingCount = message.participants || 0;
+        setParticipants(remainingCount);
+        setStatus(`👋 User left (${remainingCount} remaining)`);
         endCall();
         break;
         
       case 'error':
-        console.error('Server error:', message.message);
-        setStatus('Error: ' + (message.message || 'Unknown error'));
+        console.error('🚨 Server error:', message.message);
+        setStatus('❌ Error: ' + message.message);
         break;
         
       default:
-        console.log('Unknown message type:', message.type);
+        console.log('❓ Unknown message:', message.type);
     }
-  };
+  }, [isCaller]);
 
-  const startCall = async () => {
-    try {
-      if (!connected || !ws) {
-        setStatus('WebSocket not connected. Please connect first.');
-        return;
-      }
-
-      if (!roomId || roomId.trim() === '') {
-        setStatus('Please enter a room ID');
-        return;
-      }
-
-      // Room에 조인
-      sendMessage({
-        type: 'join-room',
-        roomId: roomId.trim()
-      });
-
-      setStatus('Joining room...');
-
-    } catch (error) {
-      console.error('Error starting call:', error);
-      setStatus('Error starting call: ' + error.message);
+  const joinRoom = useCallback(async () => {
+    if (!wsRef.current || !connected) {
+      alert('❌ Please connect to server first!');
+      return;
     }
-  };
 
-  const startLocalVideo = async () => {
+    if (!roomId.trim()) {
+      alert('❌ Please enter a room ID!');
+      return;
+    }
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true
+      console.log('🎥 Getting camera access...');
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { width: 640, height: 480 }, 
+        audio: true 
       });
       
+      localStreamRef.current = stream;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
       }
-      localStreamRef.current = stream;
-      setStatus('Camera Ready - ' + userId);
       
-      return stream;
-    } catch (error) {
-      console.error('Error accessing media devices:', error);
-      setStatus('Media Access Denied');
-      throw error;
-    }
-  };
-
-  const createPeerConnection = async (stream) => {
-    try {
-      const pc = new RTCPeerConnection({ iceServers });
-      
-      // 로컬 스트림 추가
+      // 로컬 트랙 추가 로그
       stream.getTracks().forEach(track => {
-        pc.addTrack(track, stream);
-        console.log('Added local track:', track.kind);
+        console.log('➕ Added local track:', track.kind);
       });
       
-      // 원격 스트림 처리
-      pc.ontrack = (event) => {
-        console.log('Remote stream received:', event.streams[0]);
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = event.streams[0];
-        }
-        setStatus(userId + ' - Connected with remote peer');
+      console.log('📹 Camera ready, joining room:', roomId);
+      
+      const message = {
+        type: 'join-room',
+        roomId: roomId.trim(),
+        userId: userId
       };
       
-      // ICE candidate 처리
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          console.log('Sending ICE candidate:', event.candidate.candidate);
-          
-          // WebSocket 연결 상태 확인 후 전송
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            sendMessage({
-              type: 'ice-candidate',
-              candidate: event.candidate.candidate,
-              sdpMid: event.candidate.sdpMid,
-              sdpMLineIndex: event.candidate.sdpMLineIndex,
-              roomId: roomId
-            });
-          } else {
-            console.warn('Cannot send ICE candidate - WebSocket not connected');
-          }
-        }
-      };
-      
-      pc.onconnectionstatechange = () => {
-        console.log('Connection state:', pc.connectionState);
-        if (pc.connectionState === 'connected') {
-          setStatus(userId + ' - WebRTC Connected');
-        } else if (pc.connectionState === 'failed') {
-          setStatus(userId + ' - Connection Failed');
-        } else if (pc.connectionState === 'disconnected') {
-          setStatus(userId + ' - Connection Lost');
-        }
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        console.log('ICE connection state:', pc.iceConnectionState);
-        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-          setStatus(userId + ' - Video call active');
-        }
-      };
-      
-      peerConnectionRef.current = pc;
-      setInCall(true);
-      
-      // 다른 참가자가 있을 때만 즉시 Offer 전송
-      if (participants > 0) {
-        await sendOffer();
-      }
+      console.log('📤 Sending join-room message:', message);
+      wsRef.current.send(JSON.stringify(message));
+      setStatus('📞 Joining room...');
       
     } catch (error) {
-      console.error('Error creating peer connection:', error);
-      setStatus('WebRTC Error: ' + error.message);
+      console.error('🚨 Camera access failed:', error);
+      setStatus('❌ Camera access denied');
     }
-  };
+  }, [connected, roomId, userId]);
 
-  const sendOffer = async () => {
+  const startCall = useCallback(async () => {
+    if (!localStreamRef.current) {
+      console.error('❌ No local stream');
+      return;
+    }
+
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      console.error('❌ WebSocket not ready');
+      return;
+    }
+
     try {
-      if (!peerConnectionRef.current) {
-        console.warn('No peer connection available for offer');
-        return;
-      }
+      console.log('🔗 Creating peer connection...');
       
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        console.warn('WebSocket not ready for offer');
-        return;
-      }
-      
-      const offer = await peerConnectionRef.current.createOffer({
+      const pc = new RTCPeerConnection({ iceServers });
+      peerConnectionRef.current = pc;
+
+      // 로컬 스트림 추가
+      localStreamRef.current.getTracks().forEach(track => {
+        console.log('➕ Adding track:', track.kind);
+        pc.addTrack(track, localStreamRef.current);
+      });
+
+      // 원격 스트림 처리
+      pc.ontrack = (event) => {
+        console.log('🎬 Received remote stream!');
+        if (remoteVideoRef.current && event.streams[0]) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+          setStatus('🎉 Video call connected!');
+        }
+      };
+
+      // ICE candidate 처리
+      pc.onicecandidate = (event) => {
+        if (event.candidate && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          console.log('🧊 Sending ICE candidate');
+          sendMessage({
+            type: 'ice-candidate',
+            candidate: event.candidate,
+            roomId: roomId,
+            userId: userId
+          });
+        }
+      };
+
+      // 연결 상태 모니터링
+      pc.onconnectionstatechange = () => {
+        console.log('🔗 Connection state:', pc.connectionState);
+        if (pc.connectionState === 'connected') {
+          setStatus('✅ WebRTC connected!');
+        } else if (pc.connectionState === 'failed') {
+          setStatus('❌ Connection failed');
+        }
+      };
+
+      // Offer 생성
+      console.log('📝 Creating offer...');
+      const offer = await pc.createOffer({
         offerToReceiveAudio: true,
         offerToReceiveVideo: true
       });
       
-      await peerConnectionRef.current.setLocalDescription(offer);
+      await pc.setLocalDescription(offer);
       
-      console.log('Sending offer:', offer);
+      console.log('📤 Sending offer');
       sendMessage({
         type: 'offer',
-        sdp: offer.sdp,
-        roomId: roomId
+        offer: offer,
+        roomId: roomId,
+        userId: userId
       });
       
-      setStatus(userId + ' - Calling...');
+      setInCall(true);
+      setStatus('📞 Calling...');
       
     } catch (error) {
-      console.error('Error sending offer:', error);
-      setStatus('Offer Error: ' + error.message);
+      console.error('🚨 Failed to start call:', error);
+      setStatus('❌ Call failed: ' + error.message);
     }
-  };
+  }, [roomId, userId]);
 
-  const handleAnswer = async (sdp) => {
-    try {
-      console.log('Received answer:', sdp.substring(0, 100) + '...');
-      
-      const answer = new RTCSessionDescription({
-        type: 'answer',
-        sdp: sdp
-      });
-      
-      await peerConnectionRef.current.setRemoteDescription(answer);
-      setStatus(userId + ' - Call Connected');
-      
-    } catch (error) {
-      console.error('Error handling answer:', error);
-      setStatus('Answer Error: ' + error.message);
+  const handleOffer = useCallback(async (offer) => {
+    if (!localStreamRef.current) {
+      console.error('❌ No local stream for answer');
+      return;
     }
-  };
 
-  const handleRemoteOffer = async (sdp, fromSession) => {
     try {
-      console.log('Received remote offer from:', fromSession);
+      console.log('📞 Handling offer...');
       
-      if (!peerConnectionRef.current) {
-        console.error('No peer connection available');
-        return;
-      }
-      
-      const offer = new RTCSessionDescription({
-        type: 'offer',
-        sdp: sdp
+      const pc = new RTCPeerConnection({ iceServers });
+      peerConnectionRef.current = pc;
+
+      // 로컬 스트림 추가
+      localStreamRef.current.getTracks().forEach(track => {
+        console.log('➕ Adding track for answer:', track.kind);
+        pc.addTrack(track, localStreamRef.current);
       });
+
+      // 원격 스트림 처리
+      pc.ontrack = (event) => {
+        console.log('🎬 Received remote stream in answer!');
+        if (remoteVideoRef.current && event.streams[0]) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+          setStatus('🎉 Video call connected!');
+        }
+      };
+
+      // ICE candidate 처리
+      pc.onicecandidate = (event) => {
+        if (event.candidate && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          console.log('🧊 Sending ICE candidate from answerer');
+          sendMessage({
+            type: 'ice-candidate',
+            candidate: event.candidate,
+            roomId: roomId,
+            userId: userId
+          });
+        }
+      };
+
+      // 연결 상태 모니터링
+      pc.onconnectionstatechange = () => {
+        console.log('🔗 Connection state (answerer):', pc.connectionState);
+        if (pc.connectionState === 'connected') {
+          setStatus('✅ WebRTC connected!');
+        }
+      };
+
+      // Offer 처리 및 Answer 생성
+      console.log('📝 Setting remote description and creating answer...');
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
       
-      await peerConnectionRef.current.setRemoteDescription(offer);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
       
-      // Answer 생성 및 전송
-      const answer = await peerConnectionRef.current.createAnswer();
-      await peerConnectionRef.current.setLocalDescription(answer);
-      
-      console.log('Sending answer to remote peer');
+      console.log('📤 Sending answer');
       sendMessage({
-        type: 'remote-answer',
-        sdp: answer.sdp,
-        toSession: fromSession,
-        roomId: roomId
-      });
-      
-      setStatus(userId + ' - Answering call from remote peer');
-      
-    } catch (error) {
-      console.error('Error handling remote offer:', error);
-      setStatus('Remote Offer Error: ' + error.message);
-    }
-  };
-
-  const handleRemoteAnswer = async (sdp, fromSession) => {
-    try {
-      console.log('Received remote answer from:', fromSession);
-      
-      if (!peerConnectionRef.current) {
-        console.error('No peer connection available');
-        return;
-      }
-      
-      const answer = new RTCSessionDescription({
         type: 'answer',
-        sdp: sdp
+        answer: answer,
+        roomId: roomId,
+        userId: userId
       });
       
-      await peerConnectionRef.current.setRemoteDescription(answer);
-      setStatus(userId + ' - Connected to remote peer');
+      setInCall(true);
+      setStatus('📞 Answering call...');
       
     } catch (error) {
-      console.error('Error handling remote answer:', error);
-      setStatus('Remote Answer Error: ' + error.message);
+      console.error('🚨 Failed to handle offer:', error);
+      setStatus('❌ Answer failed: ' + error.message);
     }
-  };
+  }, [roomId, userId]);
 
-  const handleIceCandidate = async (message) => {
+  const handleAnswer = useCallback(async (answer) => {
+    if (!peerConnectionRef.current) {
+      console.error('❌ No peer connection for answer');
+      return;
+    }
+
     try {
-      if (!message.candidate || !message.sdpMid || message.sdpMLineIndex === undefined) {
-        console.error('Invalid ICE candidate message:', message);
-        return;
-      }
-
-      if (!peerConnectionRef.current) {
-        console.error('No peer connection available for ICE candidate');
-        return;
-      }
-      
-      const candidate = new RTCIceCandidate({
-        candidate: message.candidate,
-        sdpMid: message.sdpMid,
-        sdpMLineIndex: message.sdpMLineIndex
-      });
-      
-      await peerConnectionRef.current.addIceCandidate(candidate);
-      console.log('Added ICE candidate from:', message.fromSession || 'server');
-      
+      console.log('📝 Setting remote description from answer...');
+      await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+      setStatus('📞 Call answered - connecting...');
     } catch (error) {
-      console.error('Error adding ICE candidate:', error);
+      console.error('🚨 Failed to set remote description:', error);
+      setStatus('❌ Failed to connect');
     }
-  };
+  }, []);
 
-  const endCall = () => {
-    // PeerConnection 정리
+  const handleIceCandidate = useCallback(async (candidate) => {
+    if (!peerConnectionRef.current) {
+      console.error('❌ No peer connection for ICE candidate');
+      return;
+    }
+
+    try {
+      console.log('🧊 Adding ICE candidate...');
+      await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (error) {
+      console.error('🚨 Failed to add ICE candidate:', error);
+    }
+  }, []);
+
+  const leaveRoom = useCallback(() => {
+    if (wsRef.current && connected) {
+      sendMessage({
+        type: 'leave-room',
+        roomId: roomId,
+        userId: userId
+      });
+    }
+    
+    endCall();
+    setParticipants(0);
+    setIsCaller(false);
+    setStatus(connected ? 'Connected - Ready to join room' : 'Disconnected');
+  }, [connected, roomId, userId]);
+
+  const endCall = useCallback(() => {
+    console.log('🔚 Ending call...');
+    
     if (peerConnectionRef.current) {
       peerConnectionRef.current.close();
       peerConnectionRef.current = null;
     }
     
-    // 로컬 스트림 정리
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
+    }
+    
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => track.stop());
       localStreamRef.current = null;
     }
     
-    // 비디오 엘리먼트 정리
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = null;
     }
-    if (remoteVideoRef.current) {
-      remoteVideoRef.current.srcObject = null;
-    }
-    
-    // 서버에 통화 종료 알림
-    if (ws && inCall) {
-      sendMessage({
-        type: 'end-call',
-        roomId: roomId
-      });
-      
-      sendMessage({
-        type: 'leave-room',
-        roomId: roomId
-      });
-    }
     
     setInCall(false);
-    setParticipants(0);
-    setStatus(connected ? 'Connected as ' + userId : 'Disconnected');
-  };
+    setIsCaller(false);
+  }, []);
 
-  const sendMessage = (message) => {
-    if (!ws) {
-      console.error('WebSocket is null');
-      setStatus('WebSocket connection lost');
-      return;
+  const sendMessage = useCallback((message) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      console.log('📤 Sending:', message.type);
+      wsRef.current.send(JSON.stringify(message));
+    } else {
+      console.error('❌ WebSocket not connected. ReadyState:', wsRef.current ? wsRef.current.readyState : 'null');
     }
-    
-    if (ws.readyState !== WebSocket.OPEN) {
-      console.error('WebSocket is not connected, state:', ws.readyState);
-      setStatus('WebSocket not connected - attempting reconnect...');
-      
-      // 자동 재연결 시도
-      setTimeout(() => {
-        if (!connected) {
-          console.log('Attempting to reconnect...');
-          connectWebSocket();
-        }
-      }, 2000);
-      return;
-    }
-    
-    // 필수 필드 검증
-    if (!message.type) {
-      console.error('Message type is required');
-      return;
-    }
-    
-    try {
-      console.log('Sending message:', message.type, message);
-      ws.send(JSON.stringify(message));
-    } catch (error) {
-      console.error('Error sending message:', error);
-      setStatus('Message send failed');
-    }
-  };
+  }, []);
 
-  const generateNewRoomId = () => {
-    const newRoomId = 'room-' + Math.random().toString(36).substr(2, 9);
-    setRoomId(newRoomId);
-  };
-
-  const copyRoomId = () => {
-    navigator.clipboard.writeText(roomId).then(() => {
-      setStatus('Room ID copied to clipboard!');
-      setTimeout(() => {
-        setStatus(connected ? 'Connected as ' + userId : 'Disconnected');
-      }, 2000);
-    });
-  };
+  const disconnectWebSocket = useCallback(() => {
+    cleanup();
+    setConnected(false);
+    setStatus('Disconnected');
+  }, [cleanup]);
 
   return (
     <div className="App">
       <header className="App-header">
-        <h1>WebRTC Multi-User Video Call</h1>
+        <h1>🎥 WebRTC Video Chat</h1>
         
-        <div className="user-info">
-          <p>Your ID: <strong>{userId}</strong></p>
-          <p>Participants in room: <strong>{participants}</strong></p>
+        <div className="info-panel">
+          <p><strong>🌐 Server:</strong> {SERVER_URL}</p>
+          <p><strong>📊 Status:</strong> <span className={connected ? 'connected' : 'disconnected'}>{status}</span></p>
+          <p><strong>👤 User ID:</strong> {userId}</p>
+          <p><strong>🏠 Room ID:</strong> {roomId}</p>
+          <p><strong>👥 Participants:</strong> {participants}</p>
+          <p><strong>📞 Role:</strong> {isCaller ? '📲 Caller' : '📱 Receiver'}</p>
+          <p><strong>🔌 WebSocket:</strong> {wsRef.current ? (wsRef.current.readyState === WebSocket.OPEN ? '✅ Open' : '⚠️ Not Open') : '❌ Null'}</p>
         </div>
         
-        <div className="status">
-          <p>Status: <span className={connected ? 'connected' : 'disconnected'}>{status}</span></p>
-        </div>
-
         <div className="controls">
-          <div className="connection-controls">
+          <div className="room-input">
+            <input 
+              type="text" 
+              value={roomId} 
+              onChange={(e) => setRoomId(e.target.value)}
+              placeholder="Enter Room ID"
+              disabled={participants > 0}
+              style={{
+                padding: '10px', 
+                fontSize: '16px', 
+                width: '200px',
+                marginRight: '10px'
+              }}
+            />
+          </div>
+          
+          <div className="action-buttons">
             {!connected ? (
-              <button onClick={connectWebSocket}>Connect to Server</button>
+              <button onClick={connectWebSocket} style={{backgroundColor: '#4CAF50'}}>
+                🔌 Connect to Server
+              </button>
             ) : (
-              <button onClick={disconnectWebSocket}>Disconnect</button>
+              <button onClick={disconnectWebSocket} style={{backgroundColor: '#f44336'}}>
+                🔌 Disconnect
+              </button>
             )}
-          </div>
-
-          <div className="room-controls">
-            <label>
-              Room ID: 
-              <input 
-                type="text" 
-                value={roomId} 
-                onChange={(e) => setRoomId(e.target.value)}
-                disabled={inCall}
-                placeholder="Enter room ID or generate new one"
-              />
-            </label>
-            <button onClick={generateNewRoomId} disabled={inCall}>New Room</button>
-            <button onClick={copyRoomId}>Copy Room ID</button>
-          </div>
-
-          <div className="call-controls">
-            {connected && !inCall && (
-              <button onClick={startCall} className="start-call">Join Room & Start Call</button>
+            
+            {connected && participants === 0 && (
+              <button onClick={joinRoom} style={{backgroundColor: '#2196F3'}}>
+                🚪 Join Room
+              </button>
             )}
-            {inCall && (
-              <button onClick={endCall} className="end-call">Leave Room</button>
+            
+            {connected && participants > 0 && (
+              <button onClick={leaveRoom} style={{backgroundColor: '#FF9800'}}>
+                🚪 Leave Room
+              </button>
             )}
           </div>
         </div>
-
-        <div className="instructions">
-          <h3>How to test with another person:</h3>
-          <ol>
-            <li>Share your Room ID with someone else</li>
-            <li>Both click "Connect to Server"</li>
-            <li>Enter the same Room ID</li>
-            <li>Both click "Join Room & Start Call"</li>
-            <li>Allow camera/microphone access</li>
-            <li>Wait for WebRTC connection to establish</li>
+        
+        <div className="test-guide">
+          <h3>🧪 Test Steps:</h3>
+          <ol style={{textAlign: 'left', maxWidth: '500px', margin: '0 auto'}}>
+            <li><strong>Both users:</strong> Click "🔌 Connect to Server"</li>
+            <li><strong>Both users:</strong> Enter the <strong>SAME Room ID</strong></li>
+            <li><strong>Both users:</strong> Click "🚪 Join Room"</li>
+            <li><strong>Allow camera access</strong> when prompted</li>
+            <li><strong>Wait</strong> - Second user will auto-start call</li>
+            <li><strong>Check console (F12)</strong> for debug info</li>
           </ol>
         </div>
-
+        
         <div className="video-container">
           <div className="video-box">
-            <h3>Your Video ({userId})</h3>
+            <h3>🎥 Your Video ({userId})</h3>
             <video 
               ref={localVideoRef} 
               autoPlay 
               muted 
               playsInline
-              width="300" 
-              height="200"
+              style={{
+                width: '320px', 
+                height: '240px', 
+                border: '3px solid #4CAF50',
+                borderRadius: '10px',
+                backgroundColor: '#000'
+              }}
             />
           </div>
           
           <div className="video-box">
-            <h3>Remote Video</h3>
+            <h3>📺 Remote Video</h3>
             <video 
               ref={remoteVideoRef} 
               autoPlay 
               playsInline
-              width="300" 
-              height="200"
+              style={{
+                width: '320px', 
+                height: '240px', 
+                border: '3px solid #2196F3',
+                borderRadius: '10px',
+                backgroundColor: '#000'
+              }}
             />
           </div>
-        </div>
-
-        <div className="debug-info">
-          <h4>Debug Info:</h4>
-          <p>WebSocket: {connected ? '🟢 Connected' : '🔴 Disconnected'}</p>
-          <p>WebRTC: {inCall ? '🟢 Active' : '🔴 Inactive'}</p>
-          <p>Room: {roomId}</p>
         </div>
       </header>
     </div>
